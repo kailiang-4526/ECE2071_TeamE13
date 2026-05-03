@@ -7,33 +7,31 @@ import numpy as np
 port = "COM4"
 baud = 115200
 sample_rate = 12000
-duration = int(input("How many seconds of audio to record? "))
-total_samples = duration * sample_rate
-audio = []
+
+
 ser = serial.Serial(port, baud, timeout=5)
 
 
 
 # Optimization: Read the entire block at once rather than byte-by-byte
 
-def read_data(duration):
-    print(f"Recording {duration} seconds...")
+def read_data(samples):
+    print(f"Recording {samples/sample_rate} seconds...")
     time.sleep(1) # Give the port time to initialize
+    audio = []
     ser.reset_input_buffer()
-    for  i in range(total_samples):
+    for  i in range(samples):
         raw_data = ser.read(size=1)
         if raw_data:
             audio.append(raw_data[0])
 
-    if len(raw_data) < total_samples:
-        print(f"Warning: Only captured {len(raw_data)} samples.")
     data = np.array(audio)
     data = (data-data.min())/data.max()
     data = data*255
     data = data.astype(np.uint8)
     return data
 
-def export_wav(data:np.array):
+def export_wav(data:np.array, sample_rate):
     # Export to WAV
     with wave.open('output.wav', 'wb') as wf:
         wf.setnchannels(1)      # Mono
@@ -65,4 +63,20 @@ while(1):
     if output_mode == "wav" or output_mode == "png" or output_mode == "csv":
         break
     print("\nInvalid input, please input wav, png or csv")
+
+if recording_mode == "m":
+    duration = int(input("How many seconds of audio to record? "))
+    total_samples = duration * sample_rate
+    output = read_data(total_samples)
+
+else:
+    pass
+
+if output_mode == "wav":
+    export_wav(output, sample_rate)
+elif output_mode == "csv":
+    export_csv(output)
+else:
+    export_png(output_mode)
+
 ser.close()

@@ -1,14 +1,14 @@
 import serial
 import time
 import wave
-import csv
-import matplotlib.pyplot as plt
 import numpy as np
+import matplotlib.pyplot as plt
+import csv
 
 # Setup
-port = "COM4"
+port = "COM3"
 baud = 115200
-sample_rate = 12000
+sample_rate = 9895
 
 
 ser = serial.Serial(port, baud, timeout=5)
@@ -17,12 +17,35 @@ ser = serial.Serial(port, baud, timeout=5)
 
 # Optimization: Read the entire block at once rather than byte-by-byte
 
-def read_data(samples):
+def read_data_manual(samples):
+    ser.write('M'.encode())
     print(f"Recording {samples/sample_rate} seconds...")
     time.sleep(1) # Give the port time to initialize
     audio = []
     ser.reset_input_buffer()
-    for  i in range(samples):
+    print(samples)
+    for i in range(samples):
+        raw_data = ser.read(size=1)
+
+        if raw_data:
+            print(samples-i)
+            audio.append(raw_data[0])
+
+    data = np.array(audio)
+    data = (data-data.min())/data.max()
+    data = data*255
+    data = data.astype(np.uint8)
+    return data
+
+def read_data_distance(distance):
+    ser.write("D".encode())
+    ser.write(distance.encode())
+    print(f"Recording while within {distance}cm")
+    time.sleep(1) # Give the port time to initialize
+    audio = []
+    raw_data=[]
+    ser.reset_input_buffer()
+    while raw_data != "\n":
         raw_data = ser.read(size=1)
         if raw_data:
             audio.append(raw_data[0])
@@ -57,7 +80,7 @@ def export_png(data:np.array):
     plt.tight_layout()
     plt.savefig('output.png')
     plt.show()
-    print("Done!, Saved as output.png")
+    print("Done! Saved as output.png")
 
 def export_csv(data:np.array):
     filename = "output.csv"
@@ -70,6 +93,7 @@ def export_csv(data:np.array):
     print("Done! Saved as output.csv")
 
 
+
 menu = """---RECORDING MODE SELECT---
 Manual (m)
 Distance Triggered (d)
@@ -80,6 +104,13 @@ while(1):
     if recording_mode == "d" or recording_mode == "m":
         break
     print("\nInvalid input, please input m or d\n")
+if recording_mode == "d":
+    while(1):
+        distance = input("What distance should trigger recording (cm)? ")
+        if distance.isnumeric():
+            distance = int(distance)
+            break
+        print("\nInvalid input, please input m or d\n")
 
 menu = """\n---OUTPUT SELECT---
 WAV file (wav)
@@ -96,7 +127,7 @@ while(1):
 if recording_mode == "m":
     duration = int(input("How many seconds of audio to record? "))
     total_samples = duration * sample_rate
-    output = read_data(total_samples)
+    output = read_data_manual(total_samples)
 
 else:
     pass

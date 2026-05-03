@@ -18,7 +18,7 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
-
+#include <stdlib.h>
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 
@@ -42,14 +42,36 @@
 /* Private variables ---------------------------------------------------------*/
 SPI_HandleTypeDef hspi1;
 
+TIM_HandleTypeDef htim2;
 TIM_HandleTypeDef htim16;
 
 UART_HandleTypeDef huart2;
 
 /* USER CODE BEGIN PV */
+volatile uint8_t ultrasonic_trigger_flag = 0;
+volatile uint8_t object_detected = 0;  // move here, make volatil
+volatile uint8_t prev_detected = 0;  // move here, make volatil
+char mode = 0;
+uint16_t user_distance = 0;
+
 void delay_us(uint16_t us) {
     __HAL_TIM_SET_COUNTER(&htim16, 0);
     while (__HAL_TIM_GET_COUNTER(&htim16) < us);
+}
+
+
+
+void process_command(char *cmd)
+{
+    if (cmd[0] == 'M')
+    {
+        mode = 'M';
+    }
+    else if (cmd[0] == 'D')
+    {
+        mode = 'D';
+        user_distance = atoi(&cmd[1]);  // convert "10" → 10
+    }
 }
 /* USER CODE END PV */
 
@@ -59,6 +81,7 @@ static void MX_GPIO_Init(void);
 static void MX_USART2_UART_Init(void);
 static void MX_SPI1_Init(void);
 static void MX_TIM16_Init(void);
+static void MX_TIM2_Init(void);
 /* USER CODE BEGIN PFP */
 
 /* USER CODE END PFP */
@@ -100,14 +123,22 @@ int main(void)
   MX_USART2_UART_Init();
   MX_SPI1_Init();
   MX_TIM16_Init();
-  HAL_TIM_Base_Start(&htim16);
-  __HAL_TIM_SET_COUNTER(&htim16, 10);
+  MX_TIM2_Init();
   /* USER CODE BEGIN 2 */
   uint8_t data;
-  char option;
-  uint8_t user_distance;
   uint8_t filtered_sample;   // To hold the result of the moving average
   uint8_t prev_sample = 0;
+
+  HAL_TIM_Base_Start(&htim16);
+  HAL_TIM_Base_Start_IT(&htim2);   // start TIM2 with interrupt
+  #define RX_BUFFER_SIZE 10
+  char rx_buffer[RX_BUFFER_SIZE];
+  uint8_t rx_index = 0;
+
+
+  HAL_GPIO_TogglePin(LD3_GPIO_Port, LD3_Pin);
+  HAL_Delay(500);
+  HAL_GPIO_TogglePin(LD3_GPIO_Port, LD3_Pin);
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -118,44 +149,86 @@ int main(void)
 
     /* USER CODE BEGIN 3 */
 
-	  char rx_buffer;
-	    if (HAL_UART_Receive(&huart2, (uint8_t *)&rx_buffer, 1, 1) == HAL_OK) {
-	        option = rx_buffer;
-	    }
+	  uint8_t byte;
 
-	  if (option == 'D'){ // distance triggering mode
-		  HAL_UART_Receive(&huart2, &user_distance, 1, 10);
+	  if (HAL_UART_Receive(&huart2, &byte, 1, 0) == HAL_OK)
+	  {
+	      if (byte == '\n')   // end of command
+	      {
+	          rx_buffer[rx_index] = '\0';  // null terminate
+	          process_command(rx_buffer);
+	          rx_index = 0; // reset buffer
+	      }
+	      else
+	      {if (rx_index < RX_BUFFER_SIZE - 1)
+	          {
+	              rx_buffer[rx_index++] = byte;
+	          }
+	      }
+	  }
 
-		  HAL_GPIO_WritePin(trigger_GPIO_Port, trigger_Pin, 1);
-		  delay_us(10); // You need a microsecond delay function here
-		  HAL_GPIO_WritePin(trigger_GPIO_Port, trigger_Pin, 0);
+	  // --- 2. Echo measurement (triggered by ISR flag) ---
+	      if (ultrasonic_trigger_flag && mode == 'D')
+	      {
+	          ultrasonic_trigger_flag = 0;
 
-		  while (HAL_GPIO_ReadPin(echo_GPIO_Port, echo_Pin) == 0);
+	          // Wait for echo HIGH (with timeout)
+	          uint32_t timeout = 100000;
+	          while (HAL_GPIO_ReadPin(echo_GPIO_Port, echo_Pin) == 0 && timeout--);
 
-		  // 3. Reset the timer counter to start measuring
-		  __HAL_TIM_SET_COUNTER(&htim16, 0);
+	          if (timeout > 0)  // echo arrived, not a timeout
+	          {
+	              __HAL_TIM_SET_COUNTER(&htim16, 0);
 
-		  // 4. Wait for Echo to go LOW
-		  while (HAL_GPIO_ReadPin(echo_GPIO_Port, echo_Pin) == 1);
+	              timeout = 100000;
+	              while (HAL_GPIO_ReadPin(echo_GPIO_Port, echo_Pin) == 1 && timeout--);
 
-		  uint16_t duration = __HAL_TIM_GET_COUNTER(&htim16);
+	              uint16_t duration = __HAL_TIM_GET_COUNTER(&htim16);
+	              uint16_t distance = (duration * 0.034f) / 2;
 
-		  uint16_t distance = (duration * 0.034) / 2; // distance in cm
+	              uint8_t new_detected = (distance < user_distance);
 
-		  if (distance < user_distance && HAL_SPI_Receive(&hspi1, &data, 1, 100) == HAL_OK){
+	              // Send stop signal on object leaving range
+	              if (prev_detected == 1 && new_detected == 0)
+	              {
+	                  char stop_char = 'S';
+	                  HAL_UART_Transmit(&huart2, (uint8_t *)&stop_char, 1, 10);
+	                  HAL_GPIO_WritePin(LD3_GPIO_Port, LD3_Pin, 0);
+	              }
 
-			  HAL_GPIO_TogglePin(LD3_GPIO_Port, LD3_Pin);
+	              prev_detected = object_detected;
+	              object_detected = new_detected;
+	          }
+	          else
+	          {
+	              // Timeout = no echo = nothing in range
+	              if (prev_detected == 1) {
+	                  char stop_char = 'S';
+	                  HAL_UART_Transmit(&huart2, (uint8_t *)&stop_char, 1, 10);
+	                  HAL_GPIO_WritePin(LD3_GPIO_Port, LD3_Pin, 0);
+	              }
+	              prev_detected = object_detected;
+	              object_detected = 0;
+	          }
+	      }
+
+	  if (mode == 'D'){ // distance triggering mode
+
+		  if (object_detected){
+			  if(HAL_SPI_Receive(&hspi1, &data, 1, 0) == HAL_OK){
+
+			  HAL_GPIO_WritePin(LD3_GPIO_Port, LD3_Pin, 1);
 			  filtered_sample = (data + prev_sample) / 2;
 
 			  /* 3. TRANSMIT: Send the filtered 8-bit byte to Python via UART */
-			  HAL_UART_Transmit(&huart2, &filtered_sample, 1, 10);
+			  HAL_UART_Transmit(&huart2, &filtered_sample, 1, 0);
 
 			  /* 4. UPDATE: Save the current raw byte to be 'prev' for next loop */
 			  prev_sample = data;
+			  }
 		  }
-		  //HAL_Delay(60);
 
-	  }else if (option == 'M' && HAL_SPI_Receive(&hspi1, &data, 1, 1) == HAL_OK){ // manual recording mode
+	  }else if (mode == 'M' && HAL_SPI_Receive(&hspi1, &data, 1, 0) == HAL_OK){ // manual recording mode
 
 		  HAL_GPIO_TogglePin(LD3_GPIO_Port, LD3_Pin);
 		     /* 2. FILTER: Moving average of length 2.
@@ -164,7 +237,7 @@ int main(void)
 		  filtered_sample = (data + prev_sample) / 2;
 
 		  /* 3. TRANSMIT: Send the filtered 8-bit byte to Python via UART */
-		  HAL_UART_Transmit(&huart2, &filtered_sample, 1,1 );
+		  HAL_UART_Transmit(&huart2, &filtered_sample, 1,0 );
 
 		  /* 4. UPDATE: Save the current raw byte to be 'prev' for next loop */
 		  prev_sample = data;
@@ -271,6 +344,51 @@ static void MX_SPI1_Init(void)
   /* USER CODE BEGIN SPI1_Init 2 */
 
   /* USER CODE END SPI1_Init 2 */
+
+}
+
+/**
+  * @brief TIM2 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM2_Init(void)
+{
+
+  /* USER CODE BEGIN TIM2_Init 0 */
+
+  /* USER CODE END TIM2_Init 0 */
+
+  TIM_ClockConfigTypeDef sClockSourceConfig = {0};
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+
+  /* USER CODE BEGIN TIM2_Init 1 */
+
+  /* USER CODE END TIM2_Init 1 */
+  htim2.Instance = TIM2;
+  htim2.Init.Prescaler = 31999;
+  htim2.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim2.Init.Period = 59;
+  htim2.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim2.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_ENABLE;
+  if (HAL_TIM_Base_Init(&htim2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
+  if (HAL_TIM_ConfigClockSource(&htim2, &sClockSourceConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim2, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM2_Init 2 */
+
+  /* USER CODE END TIM2_Init 2 */
 
 }
 
@@ -390,7 +508,18 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
+{
+    if (htim->Instance == TIM2 && mode == 'D')
+    {
+        // Just fire the trigger — nothing blocking
+        HAL_GPIO_WritePin(trigger_GPIO_Port, trigger_Pin, GPIO_PIN_SET);
+        delay_us(10);
+        HAL_GPIO_WritePin(trigger_GPIO_Port, trigger_Pin, GPIO_PIN_RESET);
 
+        ultrasonic_trigger_flag = 1;  // tell main loop to measure echo
+    }
+}
 /* USER CODE END 4 */
 
 /**

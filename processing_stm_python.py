@@ -1,6 +1,8 @@
 import serial
 import time
 import wave
+import csv
+import matplotlib.pyplot as plt
 import numpy as np
 
 # Setup

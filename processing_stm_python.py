@@ -101,7 +101,7 @@ def export_csv(data:np.array):
 
 def main():
     print("========================================")
-    print("   STM32 AUDIO DATA CLI")
+    print("    STM32 AUDIO DATA CLI    ")
     print("========================================\n")
     menu = """---SELECT RECORDING MODE---
     [m] Manual - Record for a set time

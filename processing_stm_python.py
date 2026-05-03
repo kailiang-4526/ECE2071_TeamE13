@@ -71,7 +71,7 @@ def export_wav(data:np.array, sample_rate):
         wf.setframerate(sample_rate)
         wf.writeframes(data.tobytes())
 
-    print("Done! Saved to output.wav")
+    print("Success! Saved to output.wav")
 
 def export_png(data:np.array):
     time = np.linspace(0, len(data)/sample_rate, len(data))
@@ -87,65 +87,75 @@ def export_png(data:np.array):
     plt.tight_layout()
     plt.savefig('output.png')
     plt.show()
-    print("Done! Saved as output.png")
+    print("Success! Saved as output.png")
 
 def export_csv(data:np.array):
-    filename = "output.csv"
-    with open (filename, mode = 'w', newline = '') as file:
-        writer = csv.writer(filename)
+    with open ("output.csv", mode = 'w', newline = '') as file:
+        writer = csv.writer(file)
         writer.writerow(["Sample Rate", sample_rate])
         writer.writerow(["Sample Value"])
         for value in data:
             writer.writerow([value])
-    print("Done! Saved as output.csv")
+    print("Success! Saved as output.csv")
 
 
-
-menu = """---RECORDING MODE SELECT---
-Manual (m)
-Distance Triggered (d)
-Awaiting input: """
-distance = 0
-while(1):
-    recording_mode = input(menu)
-    if recording_mode == "d" or recording_mode == "m":
-        break
-    print("\nInvalid input, please input m or d\n")
-if recording_mode == "d":
+def main():
+    print("========================================")
+    print("   STM32 AUDIO DATA CLI")
+    print("========================================\n")
+    menu = """---SELECT RECORDING MODE---
+    [m] Manual - Record for a set time
+    [d] Distance - Record while an object is in range
+    Awaiting input: """
+    distance = 0
     while(1):
-        distance = input("What distance should trigger recording (cm)? ")
-        if distance.isnumeric():
-            distance = int(distance)
+        recording_mode = input(menu).lower().strip()
+        if recording_mode == "d" or recording_mode == "m":
             break
-        print("\nInvalid input, please input m or d\n")
+        print("\nInvalid input, please input 'm' or 'd'.\n")
+    if recording_mode == "d":
+        while(1):
+            distance = input("What distance should trigger recording (cm)? ")
+            if distance.isnumeric():
+                distance = int(distance)
+                break
+            print("\nInvalid input, please enter a positive integer.\n")
 
-menu = """\n---OUTPUT SELECT---
-WAV file (wav)
-PNG file (png)
-CSV file (csv)
-Awaiting input: """
+    menu = """\n---SELECT OUTPUT FORMAT---
+    [wav] Audio File 
+    [png] Waveform Graph
+    [csv] Raw data points
+    Awaiting input: """
 
-while(1):
-    output_mode = input(menu)
-    if output_mode == "wav" or output_mode == "png" or output_mode == "csv":
-        break
-    print("\nInvalid input, please input wav, png or csv")
+    while(1):
+        output_mode = input(menu)
+        if output_mode == "wav" or output_mode == "png" or output_mode == "csv":
+            break
+        print("\nInvalid input, please input 'wav', 'png' or 'csv'.")
 
-if recording_mode == "m":
-    duration = int(input("How many seconds of audio to record? "))
-    total_samples = duration * sample_rate
-    output = read_data_manual(total_samples)
-elif recording_mode == "d":
-    output = read_data_distance(distance)
+    if recording_mode == "m":
+        duration = int(input("How many seconds of audio to record? "))
+        total_samples = duration * sample_rate
+        output = read_data_manual(total_samples)
+    elif recording_mode == "d":
+        output = read_data_distance(distance)
 
-else:
-    pass
+    if len(output_data) == 0:
+        print("Error: No data received.")
+        return
 
-if output_mode == "wav":
-    export_wav(output, sample_rate)
-elif output_mode == "csv":
-    export_csv(output)
-else:
-    export_png(output_mode)
+    else:
+        pass
 
-ser.close()
+    if output_mode == "wav":
+        export_wav(output, sample_rate)
+    elif output_mode == "csv":
+        export_csv(output)
+    else:
+        export_png(output)
+
+    ser.close()
+    print("Session complete.")
+
+if __name__ == "__main__":
+    main()

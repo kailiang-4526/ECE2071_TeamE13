@@ -6,7 +6,7 @@ import matplotlib.pyplot as plt
 import csv
 
 # Setup
-port = "COM5"
+port = "COM3"
 baud = 115200
 sample_rate = 9895
 
@@ -22,7 +22,7 @@ def read_data_manual(samples):
     print(f"Recording {samples/sample_rate} seconds...")
 
     ser.reset_input_buffer()
-    ser.write('M'.encode())
+    ser.write('M\n'.encode())
     audio = []
     print(samples)
     raw = ser.read(samples)
@@ -65,18 +65,18 @@ def read_data_distance(distance):
 
 def export_wav(data:np.array, sample_rate):
     # Export to WAV
-    with wave.open('output.wav', 'wb') as wf:
+    with wave.open(r'C:\Users\Kai Liang\Desktop\ECE 2071\project\output.wav', 'wb') as wf:
         wf.setnchannels(1)      # Mono
         wf.setsampwidth(1)      # 8-bit (1 byte per sample)
         wf.setframerate(sample_rate)
         wf.writeframes(data.tobytes())
 
-    print("Success! Saved to output.wav")
+    print("Done! Saved to output.wav")
 
 def export_png(data:np.array):
     time = np.linspace(0, len(data)/sample_rate, len(data))
 
-    plt.figure(10,4)
+    plt.figure(figsize=(10, 4))
     plt.plot(time, data)
 
     plt.title("Amplitude vs Time Waveform of audio data")
@@ -85,77 +85,71 @@ def export_png(data:np.array):
     plt.grid(True)
 
     plt.tight_layout()
-    plt.savefig('output.png')
+    plt.savefig(r'C:\Users\Kai Liang\Desktop\ECE 2071\project\output.png')
     plt.show()
-    print("Success! Saved as output.png")
+    print("Done! Saved as output.png")
 
 def export_csv(data:np.array):
-    with open ("output.csv", mode = 'w', newline = '') as file:
+    filename = r"C:\Users\Kai Liang\Desktop\ECE 2071\project\output.csv"
+    with open (filename, mode = 'w', newline = '') as file:
         writer = csv.writer(file)
         writer.writerow(["Sample Rate", sample_rate])
         writer.writerow(["Sample Value"])
         for value in data:
             writer.writerow([value])
-    print("Success! Saved as output.csv")
+    print("Done! Saved as output.csv")
 
 
-def main():
-    print("========================================")
-    print("    STM32 AUDIO DATA CLI    ")
-    print("========================================\n")
-    menu = """---SELECT RECORDING MODE---
-    [m] Manual - Record for a set time
-    [d] Distance - Record while an object is in range
-    Awaiting input: """
-    distance = 0
+print("========================================")
+print("    STM32 AUDIO DATA CLI    ")
+print("========================================\n")
+menu = """---RECORDING MODE SELECT---
+Manual (m)
+Distance Triggered (d)
+Awaiting input: """
+distance = 0
+
+while(1):
+    recording_mode = input(menu)
+    if recording_mode == "d" or recording_mode == "m":
+        break
+    print("\nInvalid input, please input m or d\n")
+if recording_mode == "d":
     while(1):
-        recording_mode = input(menu).lower().strip()
-        if recording_mode == "d" or recording_mode == "m":
+        distance = input("What distance should trigger recording (cm)? ")
+        if distance.isnumeric():
+            distance = int(distance)
             break
-        print("\nInvalid input, please input 'm' or 'd'.\n")
-    if recording_mode == "d":
-        while(1):
-            distance = input("What distance should trigger recording (cm)? ")
-            if distance.isnumeric():
-                distance = int(distance)
-                break
-            print("\nInvalid input, please enter a positive integer.\n")
+        print("\nInvalid input, please input m or d\n")
 
-    menu = """\n---SELECT OUTPUT FORMAT---
-    [wav] Audio File 
-    [png] Waveform Graph
-    [csv] Raw data points
-    Awaiting input: """
 
-    while(1):
-        output_mode = input(menu)
-        if output_mode == "wav" or output_mode == "png" or output_mode == "csv":
-            break
-        print("\nInvalid input, please input 'wav', 'png' or 'csv'.")
+menu = """\n---OUTPUT SELECT---
+WAV file (wav)
+PNG file (png)
+CSV file (csv)
+Awaiting input: """
 
-    if recording_mode == "m":
-        duration = int(input("How many seconds of audio to record? "))
-        total_samples = duration * sample_rate
-        output = read_data_manual(total_samples)
-    elif recording_mode == "d":
-        output = read_data_distance(distance)
+while(1):
+    output_mode = input(menu)
+    if output_mode == "wav" or output_mode == "png" or output_mode == "csv":
+        break
+    print("\nInvalid input, please input wav, png or csv")
 
-    if len(output_data) == 0:
-        print("Error: No data received.")
-        return
+if recording_mode == "m":
+    duration = int(input("How many seconds of audio to record? "))
+    total_samples = duration * sample_rate
+    output = read_data_manual(total_samples)
+elif recording_mode == "d":
+    output = read_data_distance(distance)
 
-    else:
-        pass
+else:
+    pass
 
-    if output_mode == "wav":
-        export_wav(output, sample_rate)
-    elif output_mode == "csv":
-        export_csv(output)
-    else:
-        export_png(output)
+if output_mode == "wav":
+    export_wav(output, sample_rate)
+elif output_mode == "csv":
+    export_csv(output)
+else:
+    export_png(output)
 
-    ser.close()
-    print("Session complete.")
-
-if __name__ == "__main__":
-    main()
+ser.close()

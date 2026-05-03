@@ -42,10 +42,15 @@
 /* Private variables ---------------------------------------------------------*/
 SPI_HandleTypeDef hspi1;
 
+TIM_HandleTypeDef htim16;
+
 UART_HandleTypeDef huart2;
 
 /* USER CODE BEGIN PV */
-
+void delay_us(uint16_t us) {
+    __HAL_TIM_SET_COUNTER(&htim16, 0);
+    while (__HAL_TIM_GET_COUNTER(&htim16) < us);
+}
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -53,6 +58,7 @@ void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_USART2_UART_Init(void);
 static void MX_SPI1_Init(void);
+static void MX_TIM16_Init(void);
 /* USER CODE BEGIN PFP */
 
 /* USER CODE END PFP */
@@ -93,8 +99,13 @@ int main(void)
   MX_GPIO_Init();
   MX_USART2_UART_Init();
   MX_SPI1_Init();
+  MX_TIM16_Init();
+  HAL_TIM_Base_Start(&htim16);
+  __HAL_TIM_SET_COUNTER(&htim16, 10);
   /* USER CODE BEGIN 2 */
   uint8_t data;
+  char option;
+  uint8_t user_distance;
   uint8_t filtered_sample;   // To hold the result of the moving average
   uint8_t prev_sample = 0;
   /* USER CODE END 2 */
@@ -106,23 +117,59 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-	  if (HAL_SPI_Receive(&hspi1, &data, 1, 100) == HAL_OK){
+
+	  char rx_buffer;
+	    if (HAL_UART_Receive(&huart2, (uint8_t *)&rx_buffer, 1, 1) == HAL_OK) {
+	        option = rx_buffer;
+	    }
+
+	  if (option == 'D'){ // distance triggering mode
+		  HAL_UART_Receive(&huart2, &user_distance, 1, 10);
+
+		  HAL_GPIO_WritePin(trigger_GPIO_Port, trigger_Pin, 1);
+		  delay_us(10); // You need a microsecond delay function here
+		  HAL_GPIO_WritePin(trigger_GPIO_Port, trigger_Pin, 0);
+
+		  while (HAL_GPIO_ReadPin(echo_GPIO_Port, echo_Pin) == 0);
+
+		  // 3. Reset the timer counter to start measuring
+		  __HAL_TIM_SET_COUNTER(&htim16, 0);
+
+		  // 4. Wait for Echo to go LOW
+		  while (HAL_GPIO_ReadPin(echo_GPIO_Port, echo_Pin) == 1);
+
+		  uint16_t duration = __HAL_TIM_GET_COUNTER(&htim16);
+
+		  uint16_t distance = (duration * 0.034) / 2; // distance in cm
+
+		  if (distance < user_distance && HAL_SPI_Receive(&hspi1, &data, 1, 100) == HAL_OK){
+
+			  HAL_GPIO_TogglePin(LD3_GPIO_Port, LD3_Pin);
+			  filtered_sample = (data + prev_sample) / 2;
+
+			  /* 3. TRANSMIT: Send the filtered 8-bit byte to Python via UART */
+			  HAL_UART_Transmit(&huart2, &filtered_sample, 1, 10);
+
+			  /* 4. UPDATE: Save the current raw byte to be 'prev' for next loop */
+			  prev_sample = data;
+		  }
+		  //HAL_Delay(60);
+
+	  }else if (option == 'M' && HAL_SPI_Receive(&hspi1, &data, 1, 1) == HAL_OK){ // manual recording mode
+
 		  HAL_GPIO_TogglePin(LD3_GPIO_Port, LD3_Pin);
-
-
-
-
-		          /* 2. FILTER: Moving average of length 2.
+		     /* 2. FILTER: Moving average of length 2.
 			 Math: (Current + Previous) / 2.
 			 Doing this in 8-bit is perfect for the MVP. */
 		  filtered_sample = (data + prev_sample) / 2;
 
 		  /* 3. TRANSMIT: Send the filtered 8-bit byte to Python via UART */
-		  HAL_UART_Transmit(&huart2, &filtered_sample, 1, 10);
+		  HAL_UART_Transmit(&huart2, &filtered_sample, 1,1 );
 
 		  /* 4. UPDATE: Save the current raw byte to be 'prev' for next loop */
 		  prev_sample = data;
 	  }
+
 
   }
   /* USER CODE END 3 */
@@ -228,6 +275,38 @@ static void MX_SPI1_Init(void)
 }
 
 /**
+  * @brief TIM16 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM16_Init(void)
+{
+
+  /* USER CODE BEGIN TIM16_Init 0 */
+
+  /* USER CODE END TIM16_Init 0 */
+
+  /* USER CODE BEGIN TIM16_Init 1 */
+
+  /* USER CODE END TIM16_Init 1 */
+  htim16.Instance = TIM16;
+  htim16.Init.Prescaler = 31;
+  htim16.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim16.Init.Period = 65535;
+  htim16.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim16.Init.RepetitionCounter = 0;
+  htim16.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_Base_Init(&htim16) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM16_Init 2 */
+
+  /* USER CODE END TIM16_Init 2 */
+
+}
+
+/**
   * @brief USART2 Initialization Function
   * @param None
   * @retval None
@@ -280,7 +359,23 @@ static void MX_GPIO_Init(void)
   __HAL_RCC_GPIOB_CLK_ENABLE();
 
   /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(trigger_GPIO_Port, trigger_Pin, GPIO_PIN_RESET);
+
+  /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(LD3_GPIO_Port, LD3_Pin, GPIO_PIN_RESET);
+
+  /*Configure GPIO pin : echo_Pin */
+  GPIO_InitStruct.Pin = echo_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(echo_GPIO_Port, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : trigger_Pin */
+  GPIO_InitStruct.Pin = trigger_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(trigger_GPIO_Port, &GPIO_InitStruct);
 
   /*Configure GPIO pin : LD3_Pin */
   GPIO_InitStruct.Pin = LD3_Pin;

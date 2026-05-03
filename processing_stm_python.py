@@ -6,50 +6,57 @@ import matplotlib.pyplot as plt
 import csv
 
 # Setup
-port = "COM3"
+port = "COM5"
 baud = 115200
 sample_rate = 9895
 
 
-ser = serial.Serial(port, baud, timeout=5)
+ser = serial.Serial(port, baud, timeout=10)
 
 
 
 # Optimization: Read the entire block at once rather than byte-by-byte
 
 def read_data_manual(samples):
-    ser.write('M'.encode())
+    
     print(f"Recording {samples/sample_rate} seconds...")
-    time.sleep(1) # Give the port time to initialize
-    audio = []
+
     ser.reset_input_buffer()
+    ser.write('M'.encode())
+    audio = []
     print(samples)
-    for i in range(samples):
-        raw_data = ser.read(size=1)
+    raw = ser.read(samples)
+    
 
-        if raw_data:
-            print(samples-i)
-            audio.append(raw_data[0])
+    data = np.frombuffer(raw, dtype=np.uint8)
+    print(len(data))
 
-    data = np.array(audio)
-    data = (data-data.min())/data.max()
-    data = data*255
-    data = data.astype(np.uint8)
+    data = (data - data.min()) / data.max()
+    data = (data * 255).astype(np.uint8)
     return data
 
 def read_data_distance(distance):
-    ser.write("D".encode())
-    ser.write(distance.encode())
-    print(f"Recording while within {distance}cm")
-    time.sleep(1) # Give the port time to initialize
-    audio = []
-    raw_data=[]
     ser.reset_input_buffer()
-    while raw_data != "\n":
-        raw_data = ser.read(size=1)
-        if raw_data:
-            audio.append(raw_data[0])
+    if distance >= 10: send_string = 'D' + str(distance) + '\n'
+    else: send_string = 'D' + '0' + str(distance) + '\n'
+    print(send_string)
+    ser.write(send_string.encode())
 
+    print(f"Recording while within {distance}cm")
+    audio = []
+    
+    time.sleep(0.1)
+    while True:
+        raw = ser.read(1)
+        if not raw:
+            break
+
+        if raw == b'S':
+            break
+
+        audio.append(raw[0])
+        
+    print(len(audio))
     data = np.array(audio)
     data = (data-data.min())/data.max()
     data = data*255
@@ -98,7 +105,7 @@ menu = """---RECORDING MODE SELECT---
 Manual (m)
 Distance Triggered (d)
 Awaiting input: """
-
+distance = 0
 while(1):
     recording_mode = input(menu)
     if recording_mode == "d" or recording_mode == "m":
@@ -128,6 +135,8 @@ if recording_mode == "m":
     duration = int(input("How many seconds of audio to record? "))
     total_samples = duration * sample_rate
     output = read_data_manual(total_samples)
+elif recording_mode == "d":
+    output = read_data_distance(distance)
 
 else:
     pass

@@ -41,6 +41,33 @@ def export_wav(data:np.array, sample_rate):
 
     print("Done! Saved to output.wav")
 
+def export_png(data:np.array):
+    time = np.linspace(0, len(data)/sample_rate, len(data))
+
+    plt.figure(10,4)
+    plt.plot(time, data)
+
+    plt.title("Amplitude vs Time Waveform of audio data")
+    plt.xlabel("Time (seconds)")
+    plt.ylabel("Amplitude")
+    plt.grid(True)
+
+    plt.tight_layout()
+    plt.savefig('output.png')
+    plt.show()
+    print("Done!, Saved as output.png")
+
+def export_csv(data:np.array):
+    filename = "output.csv"
+    with open (filename, mode = 'w', newline = ' ') as file:
+        writer = csv.writer(filename)
+        writer.writerow(["Sample Rate", sample_rate])
+        writer.writerow(["Sample Value"])
+        for value in data:
+            writer.writerow([value])
+    print("Done! Saved as output.csv")
+
+
 menu = """---RECORDING MODE SELECT---
 Manual (m)
 Distance Triggered (d)

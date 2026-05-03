@@ -84,7 +84,7 @@ def export_png(data:np.array):
 
 def export_csv(data:np.array):
     filename = "output.csv"
-    with open (filename, mode = 'w', newline = ' ') as file:
+    with open (filename, mode = 'w', newline = '') as file:
         writer = csv.writer(filename)
         writer.writerow(["Sample Rate", sample_rate])
         writer.writerow(["Sample Value"])

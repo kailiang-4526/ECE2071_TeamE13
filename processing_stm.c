@@ -18,10 +18,11 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
-#include <stdlib.h>
+
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-
+#include <stdlib.h>
+#include <string.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -41,28 +42,92 @@
 
 /* Private variables ---------------------------------------------------------*/
 SPI_HandleTypeDef hspi1;
+DMA_HandleTypeDef hdma_spi1_rx;
 
 TIM_HandleTypeDef htim2;
 TIM_HandleTypeDef htim16;
 
 UART_HandleTypeDef huart2;
+DMA_HandleTypeDef hdma_usart2_tx;
 
 /* USER CODE BEGIN PV */
+volatile uint8_t measuring_echo = 0;
 volatile uint8_t ultrasonic_trigger_flag = 0;
-volatile uint8_t object_detected = 0;  // move here, make volatil
-volatile uint8_t prev_detected = 0;  // move here, make volatil
-char mode = 0;
+volatile uint8_t object_detected = 0;  //
+volatile uint8_t prev_detected = 0;  //
+volatile char mode = 0;
 uint16_t user_distance = 0;
+volatile uint8_t rx_half_ready = 0;
+volatile uint8_t rx_full_ready = 0;
 
+volatile uint16_t echo_duration = 0;
+volatile uint8_t echo_done = 0;
+
+#define RX_BUFFER_SIZE 10
+
+#define BUF_SIZE 256
+#define MA_SIZE 4
+#define OUTLIER_THRESHOLD 90
+#define TX_BUF_SIZE 128
+uint8_t uart_tx_buf[TX_BUF_SIZE];
+volatile uint8_t uart_tx_busy = 0;
+#define UART_DMA_BUF 128
+uint8_t uart_dma_buf[2][UART_DMA_BUF];  // double buffer
+volatile uint8_t uart_dma_idx = 0;      // which buffer filling
+volatile uint8_t uart_dma_pos = 0;      // position in current buffer
+volatile uint8_t uart_dma_busy = 0;     // DMA in flight
+
+uint16_t spi_rx_buf[BUF_SIZE];
+//static uint16_t running_mean = 512;
+//static uint16_t prev_sample_16 = 0;
+//static uint8_t downsample_count = 0;
+static uint16_t prev = 0;
+static uint8_t skip = 0;
+static uint16_t running_mean = 128;
+static uint32_t ma_sum = 0;
+static uint8_t ma_buf[MA_SIZE] = {0};
+static uint8_t ma_idx = 0;
+static uint8_t initialized = 0;
 void delay_us(uint16_t us) {
     __HAL_TIM_SET_COUNTER(&htim16, 0);
     while (__HAL_TIM_GET_COUNTER(&htim16) < us);
 }
 
 
+void reset_audio_state(void)
+{
+    HAL_UART_DMAStop(&huart2);
 
+    uart_dma_busy = 0;
+    uart_dma_idx = 0;
+    uart_dma_pos = 0;
+
+    memset(uart_dma_buf, 0, sizeof(uart_dma_buf));
+
+    prev = 0;
+    skip = 0;
+    running_mean = 128;
+    ma_sum = 0;
+    ma_idx = 0;
+    initialized = 0;
+
+    memset(ma_buf, 0, sizeof(ma_buf));
+
+    __HAL_UART_CLEAR_OREFLAG(&huart2);
+    __HAL_UART_CLEAR_NEFLAG(&huart2);
+    __HAL_UART_CLEAR_FEFLAG(&huart2);
+
+    __HAL_UART_FLUSH_DRREGISTER(&huart2);
+
+    huart2.RxState = HAL_UART_STATE_READY;
+}
 void process_command(char *cmd)
 {
+	reset_audio_state();
+	ultrasonic_trigger_flag = 0;
+	measuring_echo = 0;
+	object_detected = 0;
+	prev_detected = 0;
     if (cmd[0] == 'M')
     {
         mode = 'M';
@@ -72,12 +137,86 @@ void process_command(char *cmd)
         mode = 'D';
         user_distance = atoi(&cmd[1]);  // convert "10" → 10
     }
+    else if (cmd[0] == 'S') {
+    	mode = 0;
+
+    }
+}
+
+
+
+
+
+void process_and_send(uint16_t *buf, uint16_t len)
+{
+    if (mode == 'D' && !object_detected) return;
+
+
+
+    for (int i = 0; i < len; i++)
+    {
+        uint16_t sample = buf[i];
+
+        if (skip ^= 1)
+        {
+            prev = sample;
+            continue;
+        }
+
+        // Average pair then shift 10-bit -> 8-bit
+        uint8_t out = (uint8_t)(((uint32_t)prev + sample) / 2 >> 2);
+
+        // Seed on first real sample
+        if (!initialized)
+        {
+            running_mean = out;
+            for (int j = 0; j < MA_SIZE; j++) ma_buf[j] = out;
+            ma_sum = (uint32_t)out * MA_SIZE;
+            initialized = 1;
+        }
+
+        // Outlier rejection
+        int16_t diff = (int16_t)out - (int16_t)running_mean;
+        if (diff < 0) diff = -diff;
+        if (diff > OUTLIER_THRESHOLD) out = (uint8_t)running_mean;
+
+        // Slow DC tracking
+        running_mean = (uint16_t)((running_mean * 31 + out) / 32);
+
+        // Moving average
+        ma_sum -= ma_buf[ma_idx];
+        ma_buf[ma_idx] = out;
+        ma_sum += out;
+        ma_idx = (ma_idx + 1) % MA_SIZE;
+        out = (uint8_t)(ma_sum / MA_SIZE);
+
+        uart_dma_buf[uart_dma_idx][uart_dma_pos++] = out;
+        HAL_GPIO_TogglePin(Hi_GPIO_Port, Hi_Pin);
+
+
+        if (uart_dma_pos >= UART_DMA_BUF)
+        {
+        	uint8_t filled_idx = uart_dma_idx;
+        	    uart_dma_idx ^= 1;   // swap FIRST before anything else
+        	    uart_dma_pos = 0;    // now writing into the new buffer
+
+        	    if (!uart_dma_busy)
+        	    {
+        	        uart_dma_busy = 1;
+        	        HAL_UART_Transmit_DMA(&huart2, uart_dma_buf[filled_idx], UART_DMA_BUF);
+        	    }
+        }
+
+    }
+
+
 }
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
+static void MX_DMA_Init(void);
 static void MX_USART2_UART_Init(void);
 static void MX_SPI1_Init(void);
 static void MX_TIM16_Init(void);
@@ -120,19 +259,17 @@ int main(void)
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
+  MX_DMA_Init();
   MX_USART2_UART_Init();
   MX_SPI1_Init();
   MX_TIM16_Init();
   MX_TIM2_Init();
   /* USER CODE BEGIN 2 */
-  uint8_t data;
-  uint8_t filtered_sample;   // To hold the result of the moving average
-  uint8_t prev_sample = 0;
 
   HAL_TIM_Base_Start(&htim16);
   HAL_TIM_Base_Start_IT(&htim2);   // start TIM2 with interrupt
-  #define RX_BUFFER_SIZE 10
   char rx_buffer[RX_BUFFER_SIZE];
+  HAL_SPI_Receive_DMA(&hspi1, (uint8_t*)spi_rx_buf, BUF_SIZE);
   uint8_t rx_index = 0;
 
 
@@ -148,9 +285,22 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-
+	  if (rx_half_ready)
+	      {
+	          rx_half_ready = 0;
+	          process_and_send(&spi_rx_buf[0], BUF_SIZE/2);
+	      }
+	  if (rx_full_ready)
+	  {
+		  rx_full_ready = 0;
+		  process_and_send(&spi_rx_buf[BUF_SIZE/2], BUF_SIZE/2);
+	  }
 	  uint8_t byte;
 
+	  if (__HAL_UART_GET_FLAG(&huart2, UART_FLAG_ORE))
+	  {
+	      __HAL_UART_CLEAR_OREFLAG(&huart2);
+	  }
 	  if (HAL_UART_Receive(&huart2, &byte, 1, 0) == HAL_OK)
 	  {
 	      if (byte == '\n')   // end of command
@@ -171,77 +321,53 @@ int main(void)
 	      if (ultrasonic_trigger_flag && mode == 'D')
 	      {
 	          ultrasonic_trigger_flag = 0;
+	          measuring_echo = 1;
 
-	          // Wait for echo HIGH (with timeout)
-	          uint32_t timeout = 100000;
-	          while (HAL_GPIO_ReadPin(echo_GPIO_Port, echo_Pin) == 0 && timeout--);
-
-	          if (timeout > 0)  // echo arrived, not a timeout
+	          if (echo_done)
 	          {
-	              __HAL_TIM_SET_COUNTER(&htim16, 0);
+	              echo_done = 0;
 
-	              timeout = 100000;
-	              while (HAL_GPIO_ReadPin(echo_GPIO_Port, echo_Pin) == 1 && timeout--);
+	              float distance = (echo_duration * 0.034f) / 2.0f;
 
-	              uint16_t duration = __HAL_TIM_GET_COUNTER(&htim16);
-	              uint16_t distance = (duration * 0.034f) / 2;
+	              uint16_t margin = 2;
 
-	              uint8_t new_detected = (distance < user_distance);
+	              uint16_t start_threshold =
+	                  (user_distance > margin) ? user_distance - margin : 0;
 
-	              // Send stop signal on object leaving range
-	              if (prev_detected == 1 && new_detected == 0)
+	              uint16_t stop_threshold = user_distance + margin;
+
+	              prev_detected = object_detected;
+
+	              if (!object_detected && distance < start_threshold)
+	              {
+	                  object_detected = 1;
+	                  HAL_GPIO_WritePin(LD3_GPIO_Port, LD3_Pin, GPIO_PIN_SET);
+	              }
+	              else if (object_detected && distance > stop_threshold)
+	              {
+	                  object_detected = 0;
+	              }
+
+	              if (prev_detected == 1 && object_detected == 0)
 	              {
 	                  char stop_char = 'S';
-	                  HAL_UART_Transmit(&huart2, (uint8_t *)&stop_char, 1, 10);
-	                  HAL_GPIO_WritePin(LD3_GPIO_Port, LD3_Pin, 0);
-	              }
 
-	              prev_detected = object_detected;
-	              object_detected = new_detected;
-	          }
-	          else
-	          {
-	              // Timeout = no echo = nothing in range
-	              if (prev_detected == 1) {
-	                  char stop_char = 'S';
-	                  HAL_UART_Transmit(&huart2, (uint8_t *)&stop_char, 1, 10);
-	                  HAL_GPIO_WritePin(LD3_GPIO_Port, LD3_Pin, 0);
+	                  if (!uart_dma_busy)
+	                  {
+	                      uart_dma_busy = 1;
+	                      HAL_UART_Transmit_DMA(
+	                          &huart2,
+	                          (uint8_t *)&stop_char,
+	                          1
+	                      );
+	                  }
+
+	                  HAL_GPIO_WritePin(LD3_GPIO_Port, LD3_Pin, GPIO_PIN_RESET);
 	              }
-	              prev_detected = object_detected;
-	              object_detected = 0;
 	          }
+
+	          measuring_echo = 0;            // allow next trigger
 	      }
-
-	  if (mode == 'D'){ // distance triggering mode
-
-		  if (object_detected){
-			  if(HAL_SPI_Receive(&hspi1, &data, 1, 0) == HAL_OK){
-
-			  HAL_GPIO_WritePin(LD3_GPIO_Port, LD3_Pin, 1);
-			  filtered_sample = (data + prev_sample) / 2;
-
-			  /* 3. TRANSMIT: Send the filtered 8-bit byte to Python via UART */
-			  HAL_UART_Transmit(&huart2, &filtered_sample, 1, 0);
-
-			  /* 4. UPDATE: Save the current raw byte to be 'prev' for next loop */
-			  prev_sample = data;
-			  }
-		  }
-
-	  }else if (mode == 'M' && HAL_SPI_Receive(&hspi1, &data, 1, 0) == HAL_OK){ // manual recording mode
-
-		  HAL_GPIO_TogglePin(LD3_GPIO_Port, LD3_Pin);
-		     /* 2. FILTER: Moving average of length 2.
-			 Math: (Current + Previous) / 2.
-			 Doing this in 8-bit is perfect for the MVP. */
-		  filtered_sample = (data + prev_sample) / 2;
-
-		  /* 3. TRANSMIT: Send the filtered 8-bit byte to Python via UART */
-		  HAL_UART_Transmit(&huart2, &filtered_sample, 1,0 );
-
-		  /* 4. UPDATE: Save the current raw byte to be 'prev' for next loop */
-		  prev_sample = data;
-	  }
 
 
   }
@@ -327,7 +453,7 @@ static void MX_SPI1_Init(void)
   hspi1.Instance = SPI1;
   hspi1.Init.Mode = SPI_MODE_SLAVE;
   hspi1.Init.Direction = SPI_DIRECTION_2LINES_RXONLY;
-  hspi1.Init.DataSize = SPI_DATASIZE_8BIT;
+  hspi1.Init.DataSize = SPI_DATASIZE_16BIT;
   hspi1.Init.CLKPolarity = SPI_POLARITY_LOW;
   hspi1.Init.CLKPhase = SPI_PHASE_1EDGE;
   hspi1.Init.NSS = SPI_NSS_SOFT;
@@ -440,7 +566,7 @@ static void MX_USART2_UART_Init(void)
 
   /* USER CODE END USART2_Init 1 */
   huart2.Instance = USART2;
-  huart2.Init.BaudRate = 115200;
+  huart2.Init.BaudRate = 921600;
   huart2.Init.WordLength = UART_WORDLENGTH_8B;
   huart2.Init.StopBits = UART_STOPBITS_1;
   huart2.Init.Parity = UART_PARITY_NONE;
@@ -456,6 +582,25 @@ static void MX_USART2_UART_Init(void)
   /* USER CODE BEGIN USART2_Init 2 */
 
   /* USER CODE END USART2_Init 2 */
+
+}
+
+/**
+  * Enable DMA controller clock
+  */
+static void MX_DMA_Init(void)
+{
+
+  /* DMA controller clock enable */
+  __HAL_RCC_DMA1_CLK_ENABLE();
+
+  /* DMA interrupt init */
+  /* DMA1_Channel2_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA1_Channel2_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(DMA1_Channel2_IRQn);
+  /* DMA1_Channel7_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA1_Channel7_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(DMA1_Channel7_IRQn);
 
 }
 
@@ -477,23 +622,23 @@ static void MX_GPIO_Init(void)
   __HAL_RCC_GPIOB_CLK_ENABLE();
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(trigger_GPIO_Port, trigger_Pin, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOA, Hi_Pin|trigger_Pin, GPIO_PIN_RESET);
 
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(LD3_GPIO_Port, LD3_Pin, GPIO_PIN_RESET);
 
-  /*Configure GPIO pin : echo_Pin */
-  GPIO_InitStruct.Pin = echo_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  HAL_GPIO_Init(echo_GPIO_Port, &GPIO_InitStruct);
-
-  /*Configure GPIO pin : trigger_Pin */
-  GPIO_InitStruct.Pin = trigger_Pin;
+  /*Configure GPIO pins : Hi_Pin trigger_Pin */
+  GPIO_InitStruct.Pin = Hi_Pin|trigger_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(trigger_GPIO_Port, &GPIO_InitStruct);
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : PA5 */
+  GPIO_InitStruct.Pin = GPIO_PIN_5;
+  GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING_FALLING;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
   /*Configure GPIO pin : LD3_Pin */
   GPIO_InitStruct.Pin = LD3_Pin;
@@ -501,6 +646,10 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(LD3_GPIO_Port, &GPIO_InitStruct);
+
+  /* EXTI interrupt init*/
+  HAL_NVIC_SetPriority(EXTI9_5_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(EXTI9_5_IRQn);
 
   /* USER CODE BEGIN MX_GPIO_Init_2 */
 
@@ -512,13 +661,48 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 {
     if (htim->Instance == TIM2 && mode == 'D')
     {
-        // Just fire the trigger — nothing blocking
         HAL_GPIO_WritePin(trigger_GPIO_Port, trigger_Pin, GPIO_PIN_SET);
-        delay_us(10);
-        HAL_GPIO_WritePin(trigger_GPIO_Port, trigger_Pin, GPIO_PIN_RESET);
 
-        ultrasonic_trigger_flag = 1;  // tell main loop to measure echo
+        for (volatile uint32_t i = 0; i < 320; i++);
+
+        HAL_GPIO_WritePin(trigger_GPIO_Port, trigger_Pin, GPIO_PIN_RESET);
     }
+}
+void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
+{
+    if (GPIO_Pin == echo_Pin)
+    {
+        // Rising edge
+        if (HAL_GPIO_ReadPin(echo_GPIO_Port, echo_Pin) == GPIO_PIN_SET)
+        {
+            __HAL_TIM_SET_COUNTER(&htim16, 0);
+        }
+        else // Falling edge
+        {
+            echo_duration = __HAL_TIM_GET_COUNTER(&htim16);
+            echo_done = 1;
+        }
+    }
+}
+
+void HAL_SPI_RxHalfCpltCallback(SPI_HandleTypeDef *hspi)
+{
+    rx_half_ready = 1;
+
+}
+
+void HAL_SPI_RxCpltCallback(SPI_HandleTypeDef *hspi)
+{
+    rx_full_ready = 1;
+}
+
+void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart)
+{
+
+	if (huart->Instance == USART2)
+		{
+			uart_dma_busy = 0;
+		}
 }
 /* USER CODE END 4 */
 

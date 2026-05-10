@@ -73,7 +73,7 @@ def get_next_filename(extension):
     index = 1
 
     while True:
-        filename = os.path.join(OUTPUT_DIR, f"output_{index}.{extension}")
+        filename = os.path.join(OUTPUT_DIR, f"output_TeamE13_22.05ksps_{index}.{extension}")
 
         if not os.path.exists(filename):
             return filename

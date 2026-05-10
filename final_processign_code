@@ -352,7 +352,7 @@ int main(void)
 	              // Send stop signal on object leaving range
 	              if (prev_detected == 1 && object_detected == 0)
 	              {
-	                  char stop_char = 'S';
+	                  char stop_char = '\0';
 	                  if (!uart_dma_busy)
 	                  {
 	                	  uart_dma_busy = 1;
@@ -368,7 +368,7 @@ int main(void)
 	        	  prev_detected = object_detected;
 	        	  object_detected = 0;
 	              if (prev_detected == 1) {
-	                  char stop_char = 'S';
+	                  char stop_char = '\0';
 	                  if (!uart_dma_busy)
 	                  {
 	                	  uart_dma_busy = 1;

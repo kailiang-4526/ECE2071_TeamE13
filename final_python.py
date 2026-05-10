@@ -124,7 +124,7 @@ def read_data_distance(distance):
         if not raw:
             break
 
-        if raw == b'S':
+        if raw == b'\0':
             break
 
         audio.append(raw[0])

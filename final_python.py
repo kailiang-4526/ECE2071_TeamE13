@@ -62,7 +62,6 @@ def measure_sample_rate():
     time.sleep(1.0)           # measure for exactly 1 second
     count = ser.in_waiting
     ser.reset_input_buffer()
-    print(f"Measured sample rate: {count} sps")
     return count
 
 sample_rate = 22050 # 22050

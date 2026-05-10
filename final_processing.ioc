@@ -1,739 +1,246 @@
-/* USER CODE BEGIN Header */
-/**
-  ******************************************************************************
-  * @file           : main.c
-  * @brief          : Main program body
-  ******************************************************************************
-  * @attention
-  *
-  * Copyright (c) 2026 STMicroelectronics.
-  * All rights reserved.
-  *
-  * This software is licensed under terms that can be found in the LICENSE file
-  * in the root directory of this software component.
-  * If no LICENSE file comes with this software, it is provided AS-IS.
-  *
-  ******************************************************************************
-  */
-/* USER CODE END Header */
-/* Includes ------------------------------------------------------------------*/
-#include "main.h"
-
-/* Private includes ----------------------------------------------------------*/
-/* USER CODE BEGIN Includes */
-#include <stdlib.h>
-#include <string.h>
-/* USER CODE END Includes */
-
-/* Private typedef -----------------------------------------------------------*/
-/* USER CODE BEGIN PTD */
-
-/* USER CODE END PTD */
-
-/* Private define ------------------------------------------------------------*/
-/* USER CODE BEGIN PD */
-
-/* USER CODE END PD */
-
-/* Private macro -------------------------------------------------------------*/
-/* USER CODE BEGIN PM */
-
-/* USER CODE END PM */
-
-/* Private variables ---------------------------------------------------------*/
-SPI_HandleTypeDef hspi1;
-DMA_HandleTypeDef hdma_spi1_rx;
-
-TIM_HandleTypeDef htim2;
-TIM_HandleTypeDef htim16;
-
-UART_HandleTypeDef huart2;
-DMA_HandleTypeDef hdma_usart2_tx;
-
-/* USER CODE BEGIN PV */
-volatile uint8_t measuring_echo = 0;
-volatile uint8_t ultrasonic_trigger_flag = 0;
-volatile uint8_t object_detected = 0;  //
-volatile uint8_t prev_detected = 0;  //
-volatile char mode = 0;
-uint16_t user_distance = 0;
-volatile uint8_t rx_half_ready = 0;
-volatile uint8_t rx_full_ready = 0;
-
-volatile uint16_t echo_duration = 0;
-volatile uint8_t echo_done = 0;
-
-#define RX_BUFFER_SIZE 10
-
-#define BUF_SIZE 256
-#define MA_SIZE 4
-#define OUTLIER_THRESHOLD 90
-#define TX_BUF_SIZE 128
-uint8_t uart_tx_buf[TX_BUF_SIZE];
-volatile uint8_t uart_tx_busy = 0;
-#define UART_DMA_BUF 128
-uint8_t uart_dma_buf[2][UART_DMA_BUF];  // double buffer
-volatile uint8_t uart_dma_idx = 0;      // which buffer filling
-volatile uint8_t uart_dma_pos = 0;      // position in current buffer
-volatile uint8_t uart_dma_busy = 0;     // DMA in flight
-
-uint16_t spi_rx_buf[BUF_SIZE];
-//static uint16_t running_mean = 512;
-//static uint16_t prev_sample_16 = 0;
-//static uint8_t downsample_count = 0;
-static uint16_t prev = 0;
-static uint8_t skip = 0;
-static uint16_t running_mean = 128;
-static uint32_t ma_sum = 0;
-static uint8_t ma_buf[MA_SIZE] = {0};
-static uint8_t ma_idx = 0;
-static uint8_t initialized = 0;
-void delay_us(uint16_t us) {
-    __HAL_TIM_SET_COUNTER(&htim16, 0);
-    while (__HAL_TIM_GET_COUNTER(&htim16) < us);
-}
-
-
-void reset_audio_state(void)
-{
-    HAL_UART_DMAStop(&huart2);
-
-    uart_dma_busy = 0;
-    uart_dma_idx = 0;
-    uart_dma_pos = 0;
-
-    memset(uart_dma_buf, 0, sizeof(uart_dma_buf));
-
-    prev = 0;
-    skip = 0;
-    running_mean = 128;
-    ma_sum = 0;
-    ma_idx = 0;
-    initialized = 0;
-
-    memset(ma_buf, 0, sizeof(ma_buf));
-
-    __HAL_UART_CLEAR_OREFLAG(&huart2);
-    __HAL_UART_CLEAR_NEFLAG(&huart2);
-    __HAL_UART_CLEAR_FEFLAG(&huart2);
-
-    __HAL_UART_FLUSH_DRREGISTER(&huart2);
-
-    huart2.RxState = HAL_UART_STATE_READY;
-}
-void process_command(char *cmd)
-{
-	reset_audio_state();
-	ultrasonic_trigger_flag = 0;
-	measuring_echo = 0;
-	object_detected = 0;
-	prev_detected = 0;
-    if (cmd[0] == 'M')
-    {
-        mode = 'M';
-    }
-    else if (cmd[0] == 'D')
-    {
-        mode = 'D';
-        user_distance = atoi(&cmd[1]);  // convert "10" → 10
-    }
-    else if (cmd[0] == 'S') {
-    	mode = 0;
-
-    }
-}
-
-
-
-
-
-void process_and_send(uint16_t *buf, uint16_t len)
-{
-    if (mode == 'D' && !object_detected) return;
-
-
-
-    for (int i = 0; i < len; i++)
-    {
-        uint16_t sample = buf[i];
-
-        if (skip ^= 1)
-        {
-            prev = sample;
-            continue;
-        }
-
-        // Average pair then shift 10-bit -> 8-bit
-        uint8_t out = (uint8_t)(((uint32_t)prev + sample) / 2 >> 2);
-
-        // Seed on first real sample
-        if (!initialized)
-        {
-            running_mean = out;
-            for (int j = 0; j < MA_SIZE; j++) ma_buf[j] = out;
-            ma_sum = (uint32_t)out * MA_SIZE;
-            initialized = 1;
-        }
-
-        // Outlier rejection
-        int16_t diff = (int16_t)out - (int16_t)running_mean;
-        if (diff < 0) diff = -diff;
-        if (diff > OUTLIER_THRESHOLD) out = (uint8_t)running_mean;
-
-        // Slow DC tracking
-        running_mean = (uint16_t)((running_mean * 31 + out) / 32);
-
-        // Moving average
-        ma_sum -= ma_buf[ma_idx];
-        ma_buf[ma_idx] = out;
-        ma_sum += out;
-        ma_idx = (ma_idx + 1) % MA_SIZE;
-        out = (uint8_t)(ma_sum / MA_SIZE);
-
-        uart_dma_buf[uart_dma_idx][uart_dma_pos++] = out;
-        HAL_GPIO_TogglePin(Hi_GPIO_Port, Hi_Pin);
-
-
-        if (uart_dma_pos >= UART_DMA_BUF)
-        {
-        	uint8_t filled_idx = uart_dma_idx;
-        	    uart_dma_idx ^= 1;   // swap FIRST before anything else
-        	    uart_dma_pos = 0;    // now writing into the new buffer
-
-        	    if (!uart_dma_busy)
-        	    {
-        	        uart_dma_busy = 1;
-        	        HAL_UART_Transmit_DMA(&huart2, uart_dma_buf[filled_idx], UART_DMA_BUF);
-        	    }
-        }
-
-    }
-
-
-}
-/* USER CODE END PV */
-
-/* Private function prototypes -----------------------------------------------*/
-void SystemClock_Config(void);
-static void MX_GPIO_Init(void);
-static void MX_DMA_Init(void);
-static void MX_USART2_UART_Init(void);
-static void MX_SPI1_Init(void);
-static void MX_TIM16_Init(void);
-static void MX_TIM2_Init(void);
-/* USER CODE BEGIN PFP */
-
-/* USER CODE END PFP */
-
-/* Private user code ---------------------------------------------------------*/
-/* USER CODE BEGIN 0 */
-
-/* USER CODE END 0 */
-
-/**
-  * @brief  The application entry point.
-  * @retval int
-  */
-int main(void)
-{
-
-  /* USER CODE BEGIN 1 */
-
-  /* USER CODE END 1 */
-
-  /* MCU Configuration--------------------------------------------------------*/
-
-  /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
-  HAL_Init();
-
-  /* USER CODE BEGIN Init */
-
-  /* USER CODE END Init */
-
-  /* Configure the system clock */
-  SystemClock_Config();
-
-  /* USER CODE BEGIN SysInit */
-
-  /* USER CODE END SysInit */
-
-  /* Initialize all configured peripherals */
-  MX_GPIO_Init();
-  MX_DMA_Init();
-  MX_USART2_UART_Init();
-  MX_SPI1_Init();
-  MX_TIM16_Init();
-  MX_TIM2_Init();
-  /* USER CODE BEGIN 2 */
-
-  HAL_TIM_Base_Start(&htim16);
-  HAL_TIM_Base_Start_IT(&htim2);   // start TIM2 with interrupt
-  char rx_buffer[RX_BUFFER_SIZE];
-  HAL_SPI_Receive_DMA(&hspi1, (uint8_t*)spi_rx_buf, BUF_SIZE);
-  uint8_t rx_index = 0;
-
-
-  HAL_GPIO_TogglePin(LD3_GPIO_Port, LD3_Pin);
-  HAL_Delay(500);
-  HAL_GPIO_TogglePin(LD3_GPIO_Port, LD3_Pin);
-  /* USER CODE END 2 */
-
-  /* Infinite loop */
-  /* USER CODE BEGIN WHILE */
-  while (1)
-  {
-    /* USER CODE END WHILE */
-
-    /* USER CODE BEGIN 3 */
-	  if (rx_half_ready)
-	      {
-	          rx_half_ready = 0;
-	          process_and_send(&spi_rx_buf[0], BUF_SIZE/2);
-	      }
-	  if (rx_full_ready)
-	  {
-		  rx_full_ready = 0;
-		  process_and_send(&spi_rx_buf[BUF_SIZE/2], BUF_SIZE/2);
-	  }
-	  uint8_t byte;
-
-	  if (__HAL_UART_GET_FLAG(&huart2, UART_FLAG_ORE))
-	  {
-	      __HAL_UART_CLEAR_OREFLAG(&huart2);
-	  }
-	  if (HAL_UART_Receive(&huart2, &byte, 1, 0) == HAL_OK)
-	  {
-	      if (byte == '\n')   // end of command
-	      {
-	          rx_buffer[rx_index] = '\0';  // null terminate
-	          process_command(rx_buffer);
-	          rx_index = 0; // reset buffer
-	      }
-	      else
-	      {if (rx_index < RX_BUFFER_SIZE - 1)
-	          {
-	              rx_buffer[rx_index++] = byte;
-	          }
-	      }
-	  }
-
-	  // --- 2. Echo measurement (triggered by ISR flag) ---
-	      if (ultrasonic_trigger_flag && mode == 'D')
-	      {
-	          ultrasonic_trigger_flag = 0;
-	          measuring_echo = 1;
-
-	          if (echo_done)
-	          {
-	              echo_done = 0;
-
-	              float distance = (echo_duration * 0.034f) / 2.0f;
-
-	              uint16_t margin = 2;
-
-	              uint16_t start_threshold =
-	                  (user_distance > margin) ? user_distance - margin : 0;
-
-	              uint16_t stop_threshold = user_distance + margin;
-
-	              prev_detected = object_detected;
-
-	              if (!object_detected && distance < start_threshold)
-	              {
-	                  object_detected = 1;
-	                  HAL_GPIO_WritePin(LD3_GPIO_Port, LD3_Pin, GPIO_PIN_SET);
-	              }
-	              else if (object_detected && distance > stop_threshold)
-	              {
-	                  object_detected = 0;
-	              }
-
-	              if (prev_detected == 1 && object_detected == 0)
-	              {
-	                  char stop_char = 'S';
-
-	                  if (!uart_dma_busy)
-	                  {
-	                      uart_dma_busy = 1;
-	                      HAL_UART_Transmit_DMA(
-	                          &huart2,
-	                          (uint8_t *)&stop_char,
-	                          1
-	                      );
-	                  }
-
-	                  HAL_GPIO_WritePin(LD3_GPIO_Port, LD3_Pin, GPIO_PIN_RESET);
-	              }
-	          }
-
-	          measuring_echo = 0;            // allow next trigger
-	      }
-
-
-  }
-  /* USER CODE END 3 */
-}
-
-/**
-  * @brief System Clock Configuration
-  * @retval None
-  */
-void SystemClock_Config(void)
-{
-  RCC_OscInitTypeDef RCC_OscInitStruct = {0};
-  RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
-
-  /** Configure the main internal regulator output voltage
-  */
-  if (HAL_PWREx_ControlVoltageScaling(PWR_REGULATOR_VOLTAGE_SCALE1) != HAL_OK)
-  {
-    Error_Handler();
-  }
-
-  /** Configure LSE Drive Capability
-  */
-  HAL_PWR_EnableBkUpAccess();
-  __HAL_RCC_LSEDRIVE_CONFIG(RCC_LSEDRIVE_LOW);
-
-  /** Initializes the RCC Oscillators according to the specified parameters
-  * in the RCC_OscInitTypeDef structure.
-  */
-  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_LSE|RCC_OSCILLATORTYPE_MSI;
-  RCC_OscInitStruct.LSEState = RCC_LSE_ON;
-  RCC_OscInitStruct.MSIState = RCC_MSI_ON;
-  RCC_OscInitStruct.MSICalibrationValue = 0;
-  RCC_OscInitStruct.MSIClockRange = RCC_MSIRANGE_6;
-  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
-  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_MSI;
-  RCC_OscInitStruct.PLL.PLLM = 1;
-  RCC_OscInitStruct.PLL.PLLN = 16;
-  RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV7;
-  RCC_OscInitStruct.PLL.PLLQ = RCC_PLLQ_DIV2;
-  RCC_OscInitStruct.PLL.PLLR = RCC_PLLR_DIV2;
-  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
-  {
-    Error_Handler();
-  }
-
-  /** Initializes the CPU, AHB and APB buses clocks
-  */
-  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
-                              |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
-  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
-  RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
-  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV1;
-  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
-
-  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_1) != HAL_OK)
-  {
-    Error_Handler();
-  }
-
-  /** Enable MSI Auto calibration
-  */
-  HAL_RCCEx_EnableMSIPLLMode();
-}
-
-/**
-  * @brief SPI1 Initialization Function
-  * @param None
-  * @retval None
-  */
-static void MX_SPI1_Init(void)
-{
-
-  /* USER CODE BEGIN SPI1_Init 0 */
-
-  /* USER CODE END SPI1_Init 0 */
-
-  /* USER CODE BEGIN SPI1_Init 1 */
-
-  /* USER CODE END SPI1_Init 1 */
-  /* SPI1 parameter configuration*/
-  hspi1.Instance = SPI1;
-  hspi1.Init.Mode = SPI_MODE_SLAVE;
-  hspi1.Init.Direction = SPI_DIRECTION_2LINES_RXONLY;
-  hspi1.Init.DataSize = SPI_DATASIZE_16BIT;
-  hspi1.Init.CLKPolarity = SPI_POLARITY_LOW;
-  hspi1.Init.CLKPhase = SPI_PHASE_1EDGE;
-  hspi1.Init.NSS = SPI_NSS_SOFT;
-  hspi1.Init.FirstBit = SPI_FIRSTBIT_MSB;
-  hspi1.Init.TIMode = SPI_TIMODE_DISABLE;
-  hspi1.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;
-  hspi1.Init.CRCPolynomial = 7;
-  hspi1.Init.CRCLength = SPI_CRC_LENGTH_DATASIZE;
-  hspi1.Init.NSSPMode = SPI_NSS_PULSE_DISABLE;
-  if (HAL_SPI_Init(&hspi1) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  /* USER CODE BEGIN SPI1_Init 2 */
-
-  /* USER CODE END SPI1_Init 2 */
-
-}
-
-/**
-  * @brief TIM2 Initialization Function
-  * @param None
-  * @retval None
-  */
-static void MX_TIM2_Init(void)
-{
-
-  /* USER CODE BEGIN TIM2_Init 0 */
-
-  /* USER CODE END TIM2_Init 0 */
-
-  TIM_ClockConfigTypeDef sClockSourceConfig = {0};
-  TIM_MasterConfigTypeDef sMasterConfig = {0};
-
-  /* USER CODE BEGIN TIM2_Init 1 */
-
-  /* USER CODE END TIM2_Init 1 */
-  htim2.Instance = TIM2;
-  htim2.Init.Prescaler = 31999;
-  htim2.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim2.Init.Period = 59;
-  htim2.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
-  htim2.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_ENABLE;
-  if (HAL_TIM_Base_Init(&htim2) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
-  if (HAL_TIM_ConfigClockSource(&htim2, &sClockSourceConfig) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
-  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
-  if (HAL_TIMEx_MasterConfigSynchronization(&htim2, &sMasterConfig) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  /* USER CODE BEGIN TIM2_Init 2 */
-
-  /* USER CODE END TIM2_Init 2 */
-
-}
-
-/**
-  * @brief TIM16 Initialization Function
-  * @param None
-  * @retval None
-  */
-static void MX_TIM16_Init(void)
-{
-
-  /* USER CODE BEGIN TIM16_Init 0 */
-
-  /* USER CODE END TIM16_Init 0 */
-
-  /* USER CODE BEGIN TIM16_Init 1 */
-
-  /* USER CODE END TIM16_Init 1 */
-  htim16.Instance = TIM16;
-  htim16.Init.Prescaler = 31;
-  htim16.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim16.Init.Period = 65535;
-  htim16.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
-  htim16.Init.RepetitionCounter = 0;
-  htim16.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
-  if (HAL_TIM_Base_Init(&htim16) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  /* USER CODE BEGIN TIM16_Init 2 */
-
-  /* USER CODE END TIM16_Init 2 */
-
-}
-
-/**
-  * @brief USART2 Initialization Function
-  * @param None
-  * @retval None
-  */
-static void MX_USART2_UART_Init(void)
-{
-
-  /* USER CODE BEGIN USART2_Init 0 */
-
-  /* USER CODE END USART2_Init 0 */
-
-  /* USER CODE BEGIN USART2_Init 1 */
-
-  /* USER CODE END USART2_Init 1 */
-  huart2.Instance = USART2;
-  huart2.Init.BaudRate = 921600;
-  huart2.Init.WordLength = UART_WORDLENGTH_8B;
-  huart2.Init.StopBits = UART_STOPBITS_1;
-  huart2.Init.Parity = UART_PARITY_NONE;
-  huart2.Init.Mode = UART_MODE_TX_RX;
-  huart2.Init.HwFlowCtl = UART_HWCONTROL_NONE;
-  huart2.Init.OverSampling = UART_OVERSAMPLING_16;
-  huart2.Init.OneBitSampling = UART_ONE_BIT_SAMPLE_DISABLE;
-  huart2.AdvancedInit.AdvFeatureInit = UART_ADVFEATURE_NO_INIT;
-  if (HAL_UART_Init(&huart2) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  /* USER CODE BEGIN USART2_Init 2 */
-
-  /* USER CODE END USART2_Init 2 */
-
-}
-
-/**
-  * Enable DMA controller clock
-  */
-static void MX_DMA_Init(void)
-{
-
-  /* DMA controller clock enable */
-  __HAL_RCC_DMA1_CLK_ENABLE();
-
-  /* DMA interrupt init */
-  /* DMA1_Channel2_IRQn interrupt configuration */
-  HAL_NVIC_SetPriority(DMA1_Channel2_IRQn, 0, 0);
-  HAL_NVIC_EnableIRQ(DMA1_Channel2_IRQn);
-  /* DMA1_Channel7_IRQn interrupt configuration */
-  HAL_NVIC_SetPriority(DMA1_Channel7_IRQn, 0, 0);
-  HAL_NVIC_EnableIRQ(DMA1_Channel7_IRQn);
-
-}
-
-/**
-  * @brief GPIO Initialization Function
-  * @param None
-  * @retval None
-  */
-static void MX_GPIO_Init(void)
-{
-  GPIO_InitTypeDef GPIO_InitStruct = {0};
-  /* USER CODE BEGIN MX_GPIO_Init_1 */
-
-  /* USER CODE END MX_GPIO_Init_1 */
-
-  /* GPIO Ports Clock Enable */
-  __HAL_RCC_GPIOC_CLK_ENABLE();
-  __HAL_RCC_GPIOA_CLK_ENABLE();
-  __HAL_RCC_GPIOB_CLK_ENABLE();
-
-  /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOA, Hi_Pin|trigger_Pin, GPIO_PIN_RESET);
-
-  /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(LD3_GPIO_Port, LD3_Pin, GPIO_PIN_RESET);
-
-  /*Configure GPIO pins : Hi_Pin trigger_Pin */
-  GPIO_InitStruct.Pin = Hi_Pin|trigger_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
-
-  /*Configure GPIO pin : PA5 */
-  GPIO_InitStruct.Pin = GPIO_PIN_5;
-  GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING_FALLING;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
-
-  /*Configure GPIO pin : LD3_Pin */
-  GPIO_InitStruct.Pin = LD3_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(LD3_GPIO_Port, &GPIO_InitStruct);
-
-  /* EXTI interrupt init*/
-  HAL_NVIC_SetPriority(EXTI9_5_IRQn, 0, 0);
-  HAL_NVIC_EnableIRQ(EXTI9_5_IRQn);
-
-  /* USER CODE BEGIN MX_GPIO_Init_2 */
-
-  /* USER CODE END MX_GPIO_Init_2 */
-}
-
-/* USER CODE BEGIN 4 */
-void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
-{
-    if (htim->Instance == TIM2 && mode == 'D')
-    {
-        HAL_GPIO_WritePin(trigger_GPIO_Port, trigger_Pin, GPIO_PIN_SET);
-
-        for (volatile uint32_t i = 0; i < 320; i++);
-
-        HAL_GPIO_WritePin(trigger_GPIO_Port, trigger_Pin, GPIO_PIN_RESET);
-    }
-}
-void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
-{
-    if (GPIO_Pin == echo_Pin)
-    {
-        // Rising edge
-        if (HAL_GPIO_ReadPin(echo_GPIO_Port, echo_Pin) == GPIO_PIN_SET)
-        {
-            __HAL_TIM_SET_COUNTER(&htim16, 0);
-        }
-        else // Falling edge
-        {
-            echo_duration = __HAL_TIM_GET_COUNTER(&htim16);
-            echo_done = 1;
-        }
-    }
-}
-
-void HAL_SPI_RxHalfCpltCallback(SPI_HandleTypeDef *hspi)
-{
-    rx_half_ready = 1;
-
-}
-
-void HAL_SPI_RxCpltCallback(SPI_HandleTypeDef *hspi)
-{
-    rx_full_ready = 1;
-}
-
-void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart)
-{
-
-	if (huart->Instance == USART2)
-		{
-			uart_dma_busy = 0;
-		}
-}
-/* USER CODE END 4 */
-
-/**
-  * @brief  This function is executed in case of error occurrence.
-  * @retval None
-  */
-void Error_Handler(void)
-{
-  /* USER CODE BEGIN Error_Handler_Debug */
-  /* User can add his own implementation to report the HAL error return state */
-  __disable_irq();
-  while (1)
-  {
-  }
-  /* USER CODE END Error_Handler_Debug */
-}
-
-#ifdef  USE_FULL_ASSERT
-/**
-  * @brief  Reports the name of the source file and the source line number
-  *         where the assert_param error has occurred.
-  * @param  file: pointer to the source file name
-  * @param  line: assert_param error line source number
-  * @retval None
-  */
-void assert_failed(uint8_t *file, uint32_t line)
-{
-  /* USER CODE BEGIN 6 */
-  /* User can add his own implementation to report the file name and line number,
-     ex: printf("Wrong parameters value: file %s on line %d\r\n", file, line) */
-  /* USER CODE END 6 */
-}
-#endif /* USE_FULL_ASSERT */
+#MicroXplorer Configuration settings - do not modify
+CAD.formats=
+CAD.pinconfig=
+CAD.provider=
+Dma.Request0=SPI1_RX
+Dma.Request1=USART2_TX
+Dma.RequestsNb=2
+Dma.SPI1_RX.0.Direction=DMA_PERIPH_TO_MEMORY
+Dma.SPI1_RX.0.Instance=DMA1_Channel2
+Dma.SPI1_RX.0.MemDataAlignment=DMA_MDATAALIGN_HALFWORD
+Dma.SPI1_RX.0.MemInc=DMA_MINC_ENABLE
+Dma.SPI1_RX.0.Mode=DMA_CIRCULAR
+Dma.SPI1_RX.0.PeriphDataAlignment=DMA_PDATAALIGN_HALFWORD
+Dma.SPI1_RX.0.PeriphInc=DMA_PINC_DISABLE
+Dma.SPI1_RX.0.Priority=DMA_PRIORITY_VERY_HIGH
+Dma.SPI1_RX.0.RequestParameters=Instance,Direction,PeriphInc,MemInc,PeriphDataAlignment,MemDataAlignment,Mode,Priority
+Dma.USART2_TX.1.Direction=DMA_MEMORY_TO_PERIPH
+Dma.USART2_TX.1.Instance=DMA1_Channel7
+Dma.USART2_TX.1.MemDataAlignment=DMA_MDATAALIGN_BYTE
+Dma.USART2_TX.1.MemInc=DMA_MINC_ENABLE
+Dma.USART2_TX.1.Mode=DMA_NORMAL
+Dma.USART2_TX.1.PeriphDataAlignment=DMA_PDATAALIGN_BYTE
+Dma.USART2_TX.1.PeriphInc=DMA_PINC_DISABLE
+Dma.USART2_TX.1.Priority=DMA_PRIORITY_LOW
+Dma.USART2_TX.1.RequestParameters=Instance,Direction,PeriphInc,MemInc,PeriphDataAlignment,MemDataAlignment,Mode,Priority
+File.Version=6
+GPIO.groupedBy=Group By Peripherals
+KeepUserPlacement=false
+Mcu.CPN=STM32L432KCU3
+Mcu.Family=STM32L4
+Mcu.IP0=DMA
+Mcu.IP1=NVIC
+Mcu.IP2=RCC
+Mcu.IP3=SPI1
+Mcu.IP4=SYS
+Mcu.IP5=TIM2
+Mcu.IP6=TIM16
+Mcu.IP7=USART2
+Mcu.IPNb=8
+Mcu.Name=STM32L432K(B-C)Ux
+Mcu.Package=UFQFPN32
+Mcu.Pin0=PC14-OSC32_IN (PC14)
+Mcu.Pin1=PC15-OSC32_OUT (PC15)
+Mcu.Pin10=PA14 (JTCK-SWCLK)
+Mcu.Pin11=PA15 (JTDI)
+Mcu.Pin12=PB3 (JTDO-TRACESWO)
+Mcu.Pin13=VP_SYS_VS_Systick
+Mcu.Pin14=VP_TIM2_VS_ClockSourceINT
+Mcu.Pin15=VP_TIM16_VS_ClockSourceINT
+Mcu.Pin2=PA0
+Mcu.Pin3=PA1
+Mcu.Pin4=PA2
+Mcu.Pin5=PA4
+Mcu.Pin6=PA5
+Mcu.Pin7=PA6
+Mcu.Pin8=PA7
+Mcu.Pin9=PA13 (JTMS-SWDIO)
+Mcu.PinsNb=16
+Mcu.ThirdPartyNb=0
+Mcu.UserConstants=
+Mcu.UserName=STM32L432KCUx
+MxCube.Version=6.14.0
+MxDb.Version=DB.6.0.140
+NVIC.BusFault_IRQn=true\:0\:0\:false\:false\:true\:false\:false\:false
+NVIC.DMA1_Channel2_IRQn=true\:0\:0\:false\:false\:true\:false\:true\:true
+NVIC.DMA1_Channel7_IRQn=true\:0\:0\:false\:false\:true\:false\:true\:true
+NVIC.DebugMonitor_IRQn=true\:0\:0\:false\:false\:true\:false\:false\:false
+NVIC.EXTI9_5_IRQn=true\:0\:0\:false\:false\:true\:true\:true\:true
+NVIC.ForceEnableDMAVector=true
+NVIC.HardFault_IRQn=true\:0\:0\:false\:false\:true\:false\:false\:false
+NVIC.MemoryManagement_IRQn=true\:0\:0\:false\:false\:true\:false\:false\:false
+NVIC.NonMaskableInt_IRQn=true\:0\:0\:false\:false\:true\:false\:false\:false
+NVIC.PendSV_IRQn=true\:0\:0\:false\:false\:true\:false\:false\:false
+NVIC.PriorityGroup=NVIC_PRIORITYGROUP_4
+NVIC.SVCall_IRQn=true\:0\:0\:false\:false\:true\:false\:false\:false
+NVIC.SysTick_IRQn=true\:0\:0\:true\:false\:true\:true\:true\:false
+NVIC.TIM2_IRQn=true\:0\:0\:false\:false\:true\:true\:true\:true
+NVIC.USART2_IRQn=true\:0\:0\:false\:false\:true\:true\:true\:true
+NVIC.UsageFault_IRQn=true\:0\:0\:false\:false\:true\:false\:false\:false
+PA0.GPIOParameters=GPIO_Label
+PA0.GPIO_Label=MCO [High speed clock in]
+PA0.Locked=true
+PA0.Mode=HSE-External-Clock-Source-for-LittleOrca
+PA0.Signal=RCC_CK_IN
+PA1.Mode=RX_Only_Simplex_Unidirect_Slave
+PA1.Signal=SPI1_SCK
+PA13\ (JTMS-SWDIO).GPIOParameters=GPIO_Label
+PA13\ (JTMS-SWDIO).GPIO_Label=SWDIO
+PA13\ (JTMS-SWDIO).Locked=true
+PA13\ (JTMS-SWDIO).Mode=Serial_Wire
+PA13\ (JTMS-SWDIO).Signal=SYS_JTMS-SWDIO
+PA14\ (JTCK-SWCLK).GPIOParameters=GPIO_Label
+PA14\ (JTCK-SWCLK).GPIO_Label=SWCLK
+PA14\ (JTCK-SWCLK).Locked=true
+PA14\ (JTCK-SWCLK).Mode=Serial_Wire
+PA14\ (JTCK-SWCLK).Signal=SYS_JTCK-SWCLK
+PA15\ (JTDI).GPIOParameters=GPIO_ModeDefaultPP,GPIO_Speed,GPIO_PuPd
+PA15\ (JTDI).GPIO_ModeDefaultPP=GPIO_MODE_AF_PP
+PA15\ (JTDI).GPIO_PuPd=GPIO_NOPULL
+PA15\ (JTDI).GPIO_Speed=GPIO_SPEED_FREQ_VERY_HIGH
+PA15\ (JTDI).Locked=true
+PA15\ (JTDI).Mode=Asynchronous
+PA15\ (JTDI).Signal=USART2_RX
+PA2.GPIOParameters=GPIO_ModeDefaultPP,GPIO_Speed,GPIO_PuPd
+PA2.GPIO_ModeDefaultPP=GPIO_MODE_AF_PP
+PA2.GPIO_PuPd=GPIO_NOPULL
+PA2.GPIO_Speed=GPIO_SPEED_FREQ_VERY_HIGH
+PA2.Locked=true
+PA2.Mode=Asynchronous
+PA2.Signal=USART2_TX
+PA4.GPIOParameters=GPIO_Label
+PA4.GPIO_Label=Hi
+PA4.Locked=true
+PA4.Signal=GPIO_Output
+PA5.GPIOParameters=GPIO_ModeDefaultEXTI
+PA5.GPIO_ModeDefaultEXTI=GPIO_MODE_IT_RISING_FALLING
+PA5.Locked=true
+PA5.Signal=GPXTI5
+PA6.GPIOParameters=GPIO_Label
+PA6.GPIO_Label=trigger
+PA6.Locked=true
+PA6.Signal=GPIO_Output
+PA7.Mode=RX_Only_Simplex_Unidirect_Slave
+PA7.Signal=SPI1_MOSI
+PB3\ (JTDO-TRACESWO).GPIOParameters=GPIO_Label
+PB3\ (JTDO-TRACESWO).GPIO_Label=LD3 [Green]
+PB3\ (JTDO-TRACESWO).Locked=true
+PB3\ (JTDO-TRACESWO).Signal=GPIO_Output
+PC14-OSC32_IN\ (PC14).Locked=true
+PC14-OSC32_IN\ (PC14).Mode=LSE-External-Oscillator
+PC14-OSC32_IN\ (PC14).Signal=RCC_OSC32_IN
+PC15-OSC32_OUT\ (PC15).Locked=true
+PC15-OSC32_OUT\ (PC15).Mode=LSE-External-Oscillator
+PC15-OSC32_OUT\ (PC15).Signal=RCC_OSC32_OUT
+PinOutPanel.RotationAngle=0
+ProjectManager.AskForMigrate=true
+ProjectManager.BackupPrevious=false
+ProjectManager.CompilerLinker=GCC
+ProjectManager.CompilerOptimize=6
+ProjectManager.ComputerToolchain=false
+ProjectManager.CoupleFile=false
+ProjectManager.CustomerFirmwarePackage=
+ProjectManager.DefaultFWLocation=true
+ProjectManager.DeletePrevious=true
+ProjectManager.DeviceId=STM32L432KCUx
+ProjectManager.FirmwarePackage=STM32Cube FW_L4 V1.18.2
+ProjectManager.FreePins=false
+ProjectManager.HalAssertFull=false
+ProjectManager.HeapSize=0x200
+ProjectManager.KeepUserCode=true
+ProjectManager.LastFirmware=true
+ProjectManager.LibraryCopy=1
+ProjectManager.MainLocation=Core/Src
+ProjectManager.NoMain=false
+ProjectManager.PreviousToolchain=
+ProjectManager.ProjectBuild=false
+ProjectManager.ProjectFileName=processing.ioc
+ProjectManager.ProjectName=processing
+ProjectManager.ProjectStructure=
+ProjectManager.RegisterCallBack=
+ProjectManager.StackSize=0x400
+ProjectManager.TargetToolchain=STM32CubeIDE
+ProjectManager.ToolChainLocation=
+ProjectManager.UAScriptAfterPath=
+ProjectManager.UAScriptBeforePath=
+ProjectManager.UnderRoot=true
+ProjectManager.functionlistsort=1-SystemClock_Config-RCC-false-HAL-false,2-MX_GPIO_Init-GPIO-false-HAL-true,3-MX_DMA_Init-DMA-false-HAL-true,4-MX_USART2_UART_Init-USART2-false-HAL-true,5-MX_SPI1_Init-SPI1-false-HAL-true,6-MX_TIM16_Init-TIM16-false-HAL-true,7-MX_TIM2_Init-TIM2-false-HAL-true
+RCC.48CLKFreq_Value=24000000
+RCC.AHBFreq_Value=32000000
+RCC.APB1Freq_Value=32000000
+RCC.APB1TimFreq_Value=32000000
+RCC.APB2Freq_Value=32000000
+RCC.APB2TimFreq_Value=32000000
+RCC.CortexFreq_Value=32000000
+RCC.FCLKCortexFreq_Value=32000000
+RCC.FamilyName=M
+RCC.HCLKFreq_Value=32000000
+RCC.HSE_VALUE=8000000
+RCC.HSI16_VALUE=16000000
+RCC.HSI48_VALUE=48000000
+RCC.HSI_VALUE=16000000
+RCC.I2C1Freq_Value=32000000
+RCC.I2C2Freq_Value=16000000
+RCC.I2C3Freq_Value=32000000
+RCC.IPParameters=48CLKFreq_Value,AHBFreq_Value,APB1Freq_Value,APB1TimFreq_Value,APB2Freq_Value,APB2TimFreq_Value,CortexFreq_Value,FCLKCortexFreq_Value,FamilyName,HCLKFreq_Value,HSE_VALUE,HSI16_VALUE,HSI48_VALUE,HSI_VALUE,I2C1Freq_Value,I2C2Freq_Value,I2C3Freq_Value,LCDFreq_Value,LPTIM1Freq_Value,LPTIM2Freq_Value,LPTIMFreq_Value,LPUART1Freq_Value,LPUARTFreq_Value,LSCOPinFreq_Value,LSI_VALUE,MCO1PinFreq_Value,MCOPinFreq_Value,MSI_VALUE,PLLCLKFreq_Value,PLLMUL,PLLN,PLLPoutputFreq_Value,PLLQoutputFreq_Value,PLLRCLKFreq_Value,PLLSAI1PoutputFreq_Value,PLLSAI1QoutputFreq_Value,PLLSAI1RoutputFreq_Value,PWRFreq_Value,RTCFreq_Value,RTCHSEDivFreq_Value,SAI1Freq_Value,SWPMI1Freq_Value,SYSCLKFreq_VALUE,SYSCLKSource,TIMFreq_Value,TimerFreq_Value,USART1Freq_Value,USART2Freq_Value,USART3Freq_Value,VCOInputFreq_Value,VCOOutputFreq_Value,VCOSAI1OutputFreq_Value,WatchDogFreq_Value
+RCC.LCDFreq_Value=37000
+RCC.LPTIM1Freq_Value=32000000
+RCC.LPTIM2Freq_Value=32000000
+RCC.LPTIMFreq_Value=32000000
+RCC.LPUART1Freq_Value=32000000
+RCC.LPUARTFreq_Value=32000000
+RCC.LSCOPinFreq_Value=32000
+RCC.LSI_VALUE=32000
+RCC.MCO1PinFreq_Value=32000000
+RCC.MCOPinFreq_Value=32000000
+RCC.MSI_VALUE=4000000
+RCC.PLLCLKFreq_Value=32000000
+RCC.PLLMUL=RCC_PLLMUL_4
+RCC.PLLN=16
+RCC.PLLPoutputFreq_Value=9142857.142857144
+RCC.PLLQoutputFreq_Value=32000000
+RCC.PLLRCLKFreq_Value=32000000
+RCC.PLLSAI1PoutputFreq_Value=4571428.571428572
+RCC.PLLSAI1QoutputFreq_Value=16000000
+RCC.PLLSAI1RoutputFreq_Value=16000000
+RCC.PWRFreq_Value=32000000
+RCC.RTCFreq_Value=32000
+RCC.RTCHSEDivFreq_Value=4000000
+RCC.SAI1Freq_Value=4571428.571428572
+RCC.SWPMI1Freq_Value=32000000
+RCC.SYSCLKFreq_VALUE=32000000
+RCC.SYSCLKSource=RCC_SYSCLKSOURCE_PLLCLK
+RCC.TIMFreq_Value=32000000
+RCC.TimerFreq_Value=32000000
+RCC.USART1Freq_Value=32000000
+RCC.USART2Freq_Value=32000000
+RCC.USART3Freq_Value=16000000
+RCC.VCOInputFreq_Value=4000000
+RCC.VCOOutputFreq_Value=64000000
+RCC.VCOSAI1OutputFreq_Value=32000000
+RCC.WatchDogFreq_Value=32000
+SH.GPXTI5.0=GPIO_EXTI5
+SH.GPXTI5.ConfNb=1
+SPI1.DataSize=SPI_DATASIZE_16BIT
+SPI1.Direction=SPI_DIRECTION_2LINES_RXONLY
+SPI1.IPParameters=VirtualType,Mode,Direction,DataSize
+SPI1.Mode=SPI_MODE_SLAVE
+SPI1.VirtualType=VM_SLAVE
+TIM16.IPParameters=Prescaler
+TIM16.Prescaler=31
+TIM2.AutoReloadPreload=TIM_AUTORELOAD_PRELOAD_ENABLE
+TIM2.IPParameters=Prescaler,Period,AutoReloadPreload
+TIM2.Period=59
+TIM2.Prescaler=31999
+USART2.BaudRate=921600
+USART2.IPParameters=VirtualMode-Asynchronous,BaudRate
+USART2.VirtualMode-Asynchronous=VM_ASYNC
+VP_SYS_VS_Systick.Mode=SysTick
+VP_SYS_VS_Systick.Signal=SYS_VS_Systick
+VP_TIM16_VS_ClockSourceINT.Mode=Enable_Timer
+VP_TIM16_VS_ClockSourceINT.Signal=TIM16_VS_ClockSourceINT
+VP_TIM2_VS_ClockSourceINT.Mode=Internal
+VP_TIM2_VS_ClockSourceINT.Signal=TIM2_VS_ClockSourceINT
+board=NUCLEO-L432KC
+boardIOC=true
+isbadioc=false
